@@ -1,0 +1,22 @@
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data & numerics
+numpy>=1.24.0
+pillow>=9.0.0
+
+# Visualisation
+matplotlib>=3.7.0
+
+# Dimensionality reduction (for embedding plots)
+scikit-learn>=1.2.0   # t-SNE
+umap-learn>=0.5.3     # UMAP
+
+# Experiment tracking & utilities
+tqdm>=4.65.0
+
+# Notebook / reporting
+pandas>=2.0.0
+jupyter>=1.0.0
+ipykernel>=6.0.0
