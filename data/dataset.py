@@ -2,19 +2,21 @@
 Sequential CIFAR-10 dataset for continual learning.
 
 Splits CIFAR-10 into N sequential tasks (default N=5), each with 2 classes.
-Also provides a fixed-size replay buffer with reservoir sampling.
 
 Data loading uses torchvision's CIFAR-10 (downloads automatically on first run).
+The replay buffer lives in data.buffer; it is re-exported here for convenience.
 """
 
 from __future__ import annotations
 
-import random
 from typing import List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
+
+# Re-export so existing code that does `from data.dataset import ReplayBuffer` keeps working.
+from data.buffer import ReplayBuffer  # noqa: F401
 
 # 10 CIFAR-10 classes grouped into 5 tasks (2 classes per task)
 TASK_CLASSES: List[Tuple[int, int]] = [
@@ -205,37 +207,3 @@ class SeqCIFAR10:
         indices = self._train_indices if train else self._test_indices
         return len(indices[task_id])
 
-
-class ReplayBuffer:
-    """
-    Fixed-size replay buffer with reservoir sampling.
-
-    Stores (image_tensor, label) pairs from past tasks.
-    """
-
-    def __init__(self, capacity: int = 200):
-        self.capacity = capacity
-        self._storage: List[Tuple[torch.Tensor, int]] = []
-        self._seen = 0
-
-    def update(self, images: torch.Tensor, labels: torch.Tensor) -> None:
-        """Add a batch of samples using reservoir sampling."""
-        for img, lbl in zip(images, labels):
-            self._seen += 1
-            if len(self._storage) < self.capacity:
-                self._storage.append((img.cpu(), int(lbl)))
-            else:
-                j = random.randint(0, self._seen - 1)
-                if j < self.capacity:
-                    self._storage[j] = (img.cpu(), int(lbl))
-
-    def sample(self, n: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample n items from the buffer (with replacement if needed)."""
-        if len(self._storage) == 0:
-            raise RuntimeError("Replay buffer is empty")
-        items = random.choices(self._storage, k=min(n, len(self._storage)))
-        imgs, labels = zip(*items)
-        return torch.stack(imgs), torch.tensor(labels)
-
-    def __len__(self) -> int:
-        return len(self._storage)
