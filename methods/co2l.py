@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from data.dataset import ReplayBuffer
+from data.buffer import ReplayBuffer
 from losses.supcon import SupConLoss
 from losses.distillation import AsymmetricDistillationLoss
 from methods.base import BaseMethod
@@ -60,8 +60,8 @@ class Co2L(BaseMethod):
 
     def end_task(self, task_id: int, train_loader: DataLoader) -> None:
         """Update replay buffer with samples from the finished task."""
-        # TODO: populate self.buffer with reservoir sampling over train_loader
-        raise NotImplementedError
+        self.buffer.update_from_loader(train_loader, task_id)
+        self._log(f"buffer updated — {self.buffer}")
 
     def train_task(
         self,
