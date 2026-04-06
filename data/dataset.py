@@ -3,6 +3,8 @@ Sequential CIFAR-10 dataset for continual learning.
 
 Splits CIFAR-10 into N sequential tasks (default N=5), each with 2 classes.
 Also provides a fixed-size replay buffer with reservoir sampling.
+
+Data loading uses torchvision's CIFAR-10 (downloads automatically on first run).
 """
 
 from __future__ import annotations
@@ -10,9 +12,8 @@ from __future__ import annotations
 import random
 from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
 # 10 CIFAR-10 classes grouped into 5 tasks (2 classes per task)
@@ -47,7 +48,7 @@ def get_transforms(train: bool = True) -> transforms.Compose:
     ])
 
 
-def get_supcon_transforms() -> transforms.Compose:
+def get_supcon_transforms() -> "TwoViewTransform":
     """Two-view augmentation transform for Supervised Contrastive Learning."""
     augment = transforms.Compose([
         transforms.RandomResizedCrop(32, scale=(0.2, 1.0)),
@@ -57,43 +58,61 @@ def get_supcon_transforms() -> transforms.Compose:
         transforms.ToTensor(),
         transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
     ])
-
-    class TwoViewTransform:
-        def __call__(self, x):
-            return augment(x), augment(x)
-
-    return TwoViewTransform()
+    return TwoViewTransform(augment)
 
 
-class TaskSubset(Dataset):
-    """Dataset filtered to a specific pair of classes for one task."""
+class TwoViewTransform:
+    """Applies the same augmentation twice to get two views of the same image.
 
-    def __init__(self, base_dataset: Dataset, class_pair: Tuple[int, int], transform=None):
+    Returns a tensor of shape (2, C, H, W) so DataLoader batches to (B, 2, C, H, W).
+    """
+
+    def __init__(self, transform: transforms.Compose):
         self.transform = transform
-        indices = [
-            i for i, (_, label) in enumerate(base_dataset)
-            if label in class_pair
-        ]
-        self.data = [base_dataset[i] for i in indices]
+
+    def __call__(self, x) -> torch.Tensor:
+        v1 = self.transform(x)
+        v2 = self.transform(x)
+        return torch.stack([v1, v2])  # (2, C, H, W)
+
+
+class _TransformSubset(Dataset):
+    """Wraps a raw (no-transform) CIFAR-10 dataset at specific indices with a transform.
+
+    Keeps the base dataset in PIL-image form so any transform can be applied
+    lazily, including TwoViewTransform for SupCon.
+    """
+
+    def __init__(
+        self,
+        base_dataset: datasets.CIFAR10,
+        indices: List[int],
+        transform,
+    ):
+        self._base = base_dataset
+        self._indices = indices
+        self._transform = transform
 
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self._indices)
 
     def __getitem__(self, idx: int):
-        img, label = self.data[idx]
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, label
+        img, label = self._base[self._indices[idx]]  # img is PIL Image
+        return self._transform(img), label
 
 
 class SeqCIFAR10:
     """
     Sequential CIFAR-10 for continual learning.
 
+    Downloads CIFAR-10 via torchvision on first use (stored under data_root).
+    Pre-computes per-task index lists so DataLoaders are built in O(1).
+
     Usage:
-        seq = SeqCIFAR10(data_root="../cifar-10", n_tasks=5)
+        seq = SeqCIFAR10(data_root="./data", n_tasks=5)
         train_loader = seq.get_task_loader(task_id=0, train=True)
         test_loader  = seq.get_task_loader(task_id=0, train=False)
+        supcon_loader = seq.get_task_loader(task_id=0, train=True, supcon=True)
     """
 
     N_TASKS = 5
@@ -101,30 +120,90 @@ class SeqCIFAR10:
 
     def __init__(
         self,
-        data_root: str = "../cifar-10",
+        data_root: str = "./data",
         n_tasks: int = N_TASKS,
         batch_size: int = 128,
-        num_workers: int = 2,
-        supcon_transforms: bool = False,
+        num_workers: int = 0,
     ):
         self.data_root = data_root
         self.n_tasks = n_tasks
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.supcon_transforms = supcon_transforms
         self.task_classes = TASK_CLASSES[:n_tasks]
 
-        # TODO: load raw CIFAR-10 from data_root (extracted from train.7z / test.7z)
-        # Placeholder — replace with actual loading logic once images are extracted
-        self._train_dataset = None
-        self._test_dataset = None
+        # Load raw datasets (no transform — PIL images) and download if needed
+        self._raw_train = datasets.CIFAR10(data_root, train=True,  download=True, transform=None)
+        self._raw_test  = datasets.CIFAR10(data_root, train=False, download=True, transform=None)
 
-    def get_task_loader(self, task_id: int, train: bool = True) -> DataLoader:
-        """Return a DataLoader for the given task split."""
-        raise NotImplementedError("Implement after extracting CIFAR-10 images")
+        # Pre-compute per-task index lists from the integer target arrays
+        train_targets = torch.tensor(self._raw_train.targets)
+        test_targets  = torch.tensor(self._raw_test.targets)
+
+        self._train_indices: List[List[int]] = []
+        self._test_indices:  List[List[int]] = []
+
+        for c0, c1 in self.task_classes:
+            train_mask = (train_targets == c0) | (train_targets == c1)
+            self._train_indices.append(train_mask.nonzero(as_tuple=True)[0].tolist())
+
+            test_mask = (test_targets == c0) | (test_targets == c1)
+            self._test_indices.append(test_mask.nonzero(as_tuple=True)[0].tolist())
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_task_loader(
+        self,
+        task_id: int,
+        train: bool = True,
+        supcon: bool = False,
+    ) -> DataLoader:
+        """Return a DataLoader restricted to the two classes of task_id.
+
+        Args:
+            task_id: 0-indexed task number (0..n_tasks-1).
+            train:   True for the training split, False for test.
+            supcon:  If True, applies TwoViewTransform and returns
+                     batches of shape (B, 2, C, H, W) for SupCon pre-training.
+                     Only valid when train=True.
+
+        Returns:
+            DataLoader yielding (images, labels) batches.
+        """
+        if task_id < 0 or task_id >= self.n_tasks:
+            raise ValueError(f"task_id must be in [0, {self.n_tasks - 1}], got {task_id}")
+        if supcon and not train:
+            raise ValueError("supcon=True is only valid for the training split")
+
+        if train:
+            transform = get_supcon_transforms() if supcon else get_transforms(train=True)
+            dataset = _TransformSubset(self._raw_train, self._train_indices[task_id], transform)
+        else:
+            dataset = _TransformSubset(self._raw_test, self._test_indices[task_id], get_transforms(train=False))
+
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=train,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+        )
 
     def get_classes(self, task_id: int) -> Tuple[int, int]:
+        """Return the (class_a, class_b) integer pair for the given task."""
         return self.task_classes[task_id]
+
+    def get_class_names(self, task_id: int) -> Tuple[str, str]:
+        """Return the human-readable class names for the given task."""
+        c0, c1 = self.task_classes[task_id]
+        return CLASS_NAMES[c0], CLASS_NAMES[c1]
+
+    def task_size(self, task_id: int, train: bool = True) -> int:
+        """Number of samples in a task split."""
+        indices = self._train_indices if train else self._test_indices
+        return len(indices[task_id])
 
 
 class ReplayBuffer:
