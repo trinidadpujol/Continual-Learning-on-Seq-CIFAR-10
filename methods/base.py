@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from data.dataset import TASK_CLASSES
+from data.constants import TASK_CLASSES
 from models.backbone import Backbone
 
 logger = logging.getLogger(__name__)

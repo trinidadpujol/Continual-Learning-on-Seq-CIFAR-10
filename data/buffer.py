@@ -46,7 +46,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from data.dataset import TASK_CLASSES
+from data.constants import TASK_CLASSES
 
 
 class ReplayBuffer:

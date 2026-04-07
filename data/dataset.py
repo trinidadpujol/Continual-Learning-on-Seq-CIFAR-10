@@ -15,22 +15,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
-# Re-export so existing code that does `from data.dataset import ReplayBuffer` keeps working.
-from data.buffer import ReplayBuffer  # noqa: F401
-
-# 10 CIFAR-10 classes grouped into 5 tasks (2 classes per task)
-TASK_CLASSES: List[Tuple[int, int]] = [
-    (0, 1),   # Task 0: airplane, automobile
-    (2, 3),   # Task 1: bird, cat
-    (4, 5),   # Task 2: deer, dog
-    (6, 7),   # Task 3: frog, horse
-    (8, 9),   # Task 4: ship, truck
-]
-
-CLASS_NAMES = [
-    "airplane", "automobile", "bird", "cat", "deer",
-    "dog", "frog", "horse", "ship", "truck",
-]
+from data.constants import TASK_CLASSES, CLASS_NAMES  # noqa: F401 (re-exported)
+from data.buffer import ReplayBuffer  # noqa: F401 (re-exported)
 
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD  = (0.2470, 0.2435, 0.2616)
