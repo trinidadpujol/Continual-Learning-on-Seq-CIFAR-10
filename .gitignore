@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Downloaded CIFAR-10 dataset (auto-downloaded by torchvision at runtime)
+data/cifar-10-batches-py/
+data/cifar-10-python.tar.gz
+data/cifar-10/
+
+# Saved model weights
+*.pt
+*.pth
+*.ckpt
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
