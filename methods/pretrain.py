@@ -1,23 +1,26 @@
 """
-SupCon pre-training for the backbone encoder.
+SupCon pre-training and linear probe for the backbone encoder.
 
-Trains only the encoder + projection head (no classifier) with
-Supervised Contrastive Loss on a single task's two-view augmented data.
-After this step the encoder weights are saved as a reusable checkpoint.
-The classifier head is intentionally left uninitialised until the linear
-probe phase so it can be reset cleanly with backbone.reset_classifier().
+Two-stage workflow
+------------------
+1. pretrain_supcon()      — train encoder + projector with SupConLoss
+2. train_linear_probe()   — freeze encoder, train classifier with CE loss
 
 Typical use
 -----------
-    history = pretrain_supcon(
-        backbone, seq_cifar,
-        task_id=0,
-        n_epochs=200,
-        device=device,
+    # Stage 1 – contrastive pre-training
+    pt_history = pretrain_supcon(
+        backbone, seq_cifar, task_id=0, n_epochs=200, device=device,
         checkpoint_dir="checkpoints",
     )
-    print(history["loss_history"])           # list[float], one per epoch
-    print(history["checkpoint_path"])        # path to saved .pt file
+
+    # Stage 2 – linear probe (encoder stays frozen)
+    probe_history = train_linear_probe(
+        backbone, seq_cifar, task_id=0, n_epochs=100, device=device,
+        checkpoint_dir="checkpoints",
+    )
+    print(probe_history["test_acc"])          # float
+    print(probe_history["checkpoint_path"])   # path to saved .pt file
 """
 
 from __future__ import annotations
@@ -156,6 +159,178 @@ def pretrain_supcon(
     return {
         "loss_history":    loss_history,
         "checkpoint_path": final_path,
+    }
+
+
+def train_linear_probe(
+    backbone: Backbone,
+    seq_cifar: SeqCIFAR10,
+    task_id: int = 0,
+    n_epochs: int = 100,
+    lr: float = 1.0,
+    momentum: float = 0.9,
+    weight_decay: float = 0.0,
+    device: Optional[torch.device] = None,
+    checkpoint_dir: str = "checkpoints",
+) -> Dict[str, object]:
+    """Freeze the encoder and train a linear classification head with CE loss.
+
+    Must be called after pretrain_supcon().  The encoder is frozen before
+    training begins and the freeze is verified every epoch — a RuntimeError
+    is raised if any encoder gradient somehow appears.
+
+    The classifier is reset (Kaiming-uniform init) at the start so that
+    it trains purely from the frozen features and does not inherit any
+    gradient signal from the contrastive phase.
+
+    Args:
+        backbone:        Backbone with a pre-trained encoder.
+        seq_cifar:       SeqCIFAR10 dataset helper.
+        task_id:         Task whose two classes to use for probe training/eval.
+        n_epochs:        Number of training epochs for the linear head.
+        lr:              Initial SGD learning rate (cosine-annealed).
+        momentum:        SGD momentum.
+        weight_decay:    L2 regularisation (typically 0 for a linear probe).
+        device:          Training device.
+        checkpoint_dir:  Directory for the saved checkpoint.
+
+    Returns:
+        dict with:
+          ``loss_history``      – list[float], mean CE loss per epoch.
+          ``train_acc_history`` – list[float], training accuracy per epoch.
+          ``test_acc``          – float, final accuracy on the task test split.
+          ``checkpoint_path``   – str, path to the saved checkpoint.
+
+    Raises:
+        RuntimeError: if any encoder parameter has requires_grad=True during
+                      training (encoder-freeze sanity check).
+    """
+    if device is None:
+        device = next(backbone.parameters()).device
+
+    backbone = backbone.to(device)
+
+    # ── 1. Freeze encoder; reset classifier ───────────────────────────────
+    backbone.freeze_encoder()
+    backbone.reset_classifier()
+
+    if not backbone.is_encoder_frozen:
+        raise RuntimeError(
+            "freeze_encoder() was called but is_encoder_frozen is still False. "
+            "Check Backbone.freeze_encoder() implementation."
+        )
+
+    c0_name, c1_name = seq_cifar.get_class_names(task_id)
+    logger.info(
+        "[train_linear_probe] task=%d  classes=(%s, %s)  n_epochs=%d  lr=%.4f",
+        task_id, c0_name, c1_name, n_epochs, lr,
+    )
+
+    # ── 2. Data ────────────────────────────────────────────────────────────
+    train_loader = seq_cifar.get_task_loader(task_id, train=True,  supcon=False)
+    test_loader  = seq_cifar.get_task_loader(task_id, train=False)
+
+    # ── 3. Optimise only the classifier head ──────────────────────────────
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(
+        backbone.classifier.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs
+    )
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # ── 4. Training loop ───────────────────────────────────────────────────
+    loss_history:      List[float] = []
+    train_acc_history: List[float] = []
+
+    for epoch in range(n_epochs):
+        # Sanity-check: encoder must stay frozen every epoch
+        if not backbone.is_encoder_frozen:
+            raise RuntimeError(
+                f"Encoder became unfrozen at epoch {epoch + 1}. "
+                "Probe training aborted to prevent encoder contamination."
+            )
+
+        backbone.eval()   # BN / Dropout in eval mode (encoder frozen)
+        backbone.classifier.train()   # only the head in train mode
+
+        epoch_loss, correct, total = 0.0, 0, 0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+
+            with torch.no_grad():
+                h = backbone._extract_features(x)   # frozen, no grad needed
+
+            logits = backbone.classifier(h)         # only head gets gradients
+            loss   = criterion(logits, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            correct    += (logits.argmax(1) == y).sum().item()
+            total      += y.size(0)
+
+        scheduler.step()
+
+        mean_loss  = epoch_loss / max(len(train_loader), 1)
+        train_acc  = correct / max(total, 1)
+        loss_history.append(mean_loss)
+        train_acc_history.append(train_acc)
+
+        logger.info(
+            "[train_linear_probe] epoch=%d/%d  loss=%.4f  train_acc=%.3f  lr=%.6f",
+            epoch + 1, n_epochs, mean_loss, train_acc,
+            scheduler.get_last_lr()[0],
+        )
+
+    # ── 5. Final evaluation on the test split ─────────────────────────────
+    backbone.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(device), y.to(device)
+            logits = backbone(x)
+            correct += (logits.argmax(1) == y).sum().item()
+            total   += y.size(0)
+    test_acc = correct / max(total, 1)
+
+    logger.info(
+        "[train_linear_probe] task=%d  test_acc=%.3f  (encoder frozen: %s)",
+        task_id, test_acc, backbone.is_encoder_frozen,
+    )
+
+    # ── 6. Save checkpoint ─────────────────────────────────────────────────
+    ckpt_path = os.path.join(checkpoint_dir, f"linear_probe_task{task_id}.pt")
+    torch.save(
+        {
+            "backbone_state_dict": backbone.state_dict(),
+            "loss_history":        loss_history,
+            "train_acc_history":   train_acc_history,
+            "test_acc":            test_acc,
+            "task_id":             task_id,
+            "config": {
+                "n_epochs":    n_epochs,
+                "lr":          lr,
+                "feat_dim":    backbone.feat_dim,
+                "num_classes": backbone.num_classes,
+            },
+        },
+        ckpt_path,
+    )
+    logger.info("[train_linear_probe] checkpoint saved → %s", ckpt_path)
+
+    return {
+        "loss_history":      loss_history,
+        "train_acc_history": train_acc_history,
+        "test_acc":          test_acc,
+        "checkpoint_path":   ckpt_path,
     }
 
 
