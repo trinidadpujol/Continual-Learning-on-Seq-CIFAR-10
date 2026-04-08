@@ -51,6 +51,7 @@ def pretrain_supcon(
     device: Optional[torch.device] = None,
     checkpoint_dir: str = "checkpoints",
     checkpoint_every: int = 0,
+    save_stages: bool = False,
 ) -> Dict[str, object]:
     """Pre-train the backbone encoder with Supervised Contrastive Loss.
 
@@ -71,11 +72,17 @@ def pretrain_supcon(
         checkpoint_dir:   Directory to save checkpoints.  Created if absent.
         checkpoint_every: Save an intermediate checkpoint every this many epochs.
                           0 (default) saves only the final checkpoint.
+        save_stages:      If True, additionally save snapshots at epoch 0
+                          (before any training) and epoch n_epochs//2 (midpoint).
+                          Used by the visualisation stage to produce init/mid/final
+                          embedding projections.
 
     Returns:
         dict with:
           ``loss_history``    – list[float], mean SupCon loss per epoch.
           ``checkpoint_path`` – str, path to the final saved checkpoint.
+          ``stage_paths``     – dict {"init": str, "mid": str, "final": str}
+                                (only present when save_stages=True).
     """
     if device is None:
         device = next(backbone.parameters()).device
@@ -110,6 +117,16 @@ def pretrain_supcon(
     # ── Checkpoint dir ─────────────────────────────────────────────────────
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # ── Stage snapshot: epoch 0 (before any training) ─────────────────────
+    stage_paths: Dict[str, str] = {}
+    if save_stages:
+        init_path = os.path.join(checkpoint_dir, f"supcon_stage_init_task{task_id}.pt")
+        _save_checkpoint(backbone, 0, [], init_path, temperature)
+        stage_paths["init"] = init_path
+        logger.info("[pretrain_supcon] stage checkpoint (init) → %s", init_path)
+
+    mid_epoch = n_epochs // 2
+
     # ── Training loop ──────────────────────────────────────────────────────
     loss_history: List[float] = []
 
@@ -143,6 +160,13 @@ def pretrain_supcon(
             scheduler.get_last_lr()[0],
         )
 
+        # ── Stage snapshot: midpoint ──────────────────────────────────────
+        if save_stages and (epoch + 1) == mid_epoch:
+            mid_path = os.path.join(checkpoint_dir, f"supcon_stage_mid_task{task_id}.pt")
+            _save_checkpoint(backbone, epoch + 1, loss_history, mid_path, temperature)
+            stage_paths["mid"] = mid_path
+            logger.info("[pretrain_supcon] stage checkpoint (mid) → %s", mid_path)
+
         # ── Intermediate checkpoint ────────────────────────────────────────
         if checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0:
             ckpt_path = os.path.join(
@@ -156,10 +180,14 @@ def pretrain_supcon(
     _save_checkpoint(backbone, n_epochs, loss_history, final_path, temperature)
     logger.info("[pretrain_supcon] final checkpoint → %s", final_path)
 
-    return {
+    result: Dict[str, object] = {
         "loss_history":    loss_history,
         "checkpoint_path": final_path,
     }
+    if save_stages:
+        stage_paths["final"] = final_path
+        result["stage_paths"] = stage_paths
+    return result
 
 
 def train_linear_probe(
