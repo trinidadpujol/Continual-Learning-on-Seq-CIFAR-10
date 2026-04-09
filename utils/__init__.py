@@ -4,4 +4,14 @@ from utils.metrics import (
     compute_forgetting,
     MetricsTracker,
 )
-from utils.visualization import plot_accuracy_curve, plot_embeddings
+from utils.visualization import (
+    plot_accuracy_curve,
+    plot_forgetting_curve,
+    plot_comparison,
+    plot_forgetting_heatmap,
+    plot_embeddings,
+    plot_pretrain_loss,
+    plot_embedding_stages,
+    plot_probe_accuracy,
+    plot_loss_curve,
+)

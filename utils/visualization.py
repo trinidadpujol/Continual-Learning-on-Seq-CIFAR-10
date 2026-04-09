@@ -33,6 +33,15 @@ _PALETTE = [
     "#9c755f", "#bab0ac",
 ]
 
+# Fixed colours per CL method for cross-plot consistency
+_METHOD_COLORS = {
+    "Naive": "#e15759",
+    "EWC":   "#4e79a7",
+    "LwF":   "#f28e2b",
+    "Co²L":  "#59a14f",
+}
+_MARKERS = ["o", "s", "^", "D", "v", "P", "X"]
+
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -284,37 +293,44 @@ def plot_accuracy_curve(
     results: Dict[str, List[float]],
     scenario: str = "Class-IL",
     save_path: Optional[Path] = None,
+    task_names: Optional[List[str]] = None,
+    y_min: float = 0.0,
 ) -> None:
-    """Plot accuracy vs. number of tasks learned for multiple methods.
+    """Plot average accuracy vs. tasks learned for all methods.
 
     Args:
-        results:   {method_name: [avg_acc_after_task_0, ..., avg_acc_after_task_N]}
-        scenario:  "Class-IL" or "Task-IL" (used in title and filename).
-        save_path: Where to save.  Defaults to imgs/<scenario>_accuracy.png.
+        results:    {method_name: [avg_acc_after_task_0, …, avg_acc_after_task_N]}
+        scenario:   "Class-IL" or "Task-IL" — used in title and default filename.
+        save_path:  Where to save.  Defaults to imgs/<scenario>_accuracy.png.
+        task_names: Optional list of task labels for the x-axis ticks
+                    (e.g. ["T0","T1",…]).  Defaults to "1","2",….
+        y_min:      Lower y-axis limit (default 0).  Set e.g. 0.3 to zoom in.
     """
     if save_path is None:
         fname = scenario.lower().replace("-", "_") + "_accuracy.png"
         save_path = IMGS_DIR / fname
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    markers = ["o", "s", "^", "D", "v"]
+    n_tasks = max(len(v) for v in results.values())
+    x       = list(range(1, n_tasks + 1))
+    xlabels = task_names if task_names else [str(i) for i in x]
 
+    fig, ax = plt.subplots(figsize=(8, 5))
     for i, (method, accs) in enumerate(results.items()):
-        tasks = list(range(1, len(accs) + 1))
         ax.plot(
-            tasks, accs,
-            marker=markers[i % len(markers)],
-            linewidth=1.8, markersize=6,
-            label=method,
+            range(1, len(accs) + 1), accs,
+            marker=_MARKERS[i % len(_MARKERS)],
+            color=_METHOD_COLORS.get(method, _PALETTE[i % len(_PALETTE)]),
+            linewidth=2.0, markersize=7, label=method,
         )
 
-    ax.set_xlabel("Tasks learned")
-    ax.set_ylabel("Average accuracy")
-    ax.set_title(f"{scenario} — Average Accuracy vs. Tasks Learned")
-    ax.set_xticks(list(range(1, max(len(v) for v in results.values()) + 1)))
-    ax.set_ylim(0, 1)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.set_xlabel("Number of tasks learned", fontsize=11)
+    ax.set_ylabel("Average accuracy", fontsize=11)
+    ax.set_title(f"{scenario} — Average Accuracy vs. Tasks Learned", fontsize=12)
+    ax.set_xticks(x); ax.set_xticklabels(xlabels)
+    ax.set_ylim(y_min, 1.02)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(loc="best", fontsize=10, framealpha=0.9)
     fig.tight_layout()
     _save(fig, Path(save_path))
 
@@ -322,34 +338,179 @@ def plot_accuracy_curve(
 def plot_forgetting_curve(
     forgetting: Dict[str, List[float]],
     save_path: Optional[Path] = None,
+    task_names: Optional[List[str]] = None,
 ) -> None:
-    """Plot forgetting per task for each method.
+    """Plot per-task forgetting for each method.
+
+    Forgetting_j = accuracy on task j right after learning it
+                   minus accuracy on task j after learning all tasks.
 
     Args:
-        forgetting: {method_name: [forgetting_task_0, ..., forgetting_task_{N-2}]}
-                    (task N-1 has no forgetting — it's the last task trained).
+        forgetting: {method_name: [F_0, F_1, …, F_{T-2}]}
+                    The last task has no forgetting entry by definition.
         save_path:  Where to save.  Defaults to imgs/forgetting.png.
+        task_names: Optional x-axis tick labels.
     """
     if save_path is None:
         save_path = IMGS_DIR / "forgetting.png"
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    markers = ["o", "s", "^", "D", "v"]
+    n_tasks = max(len(v) for v in forgetting.values())
+    x       = list(range(n_tasks))
+    xlabels = task_names[:n_tasks] if task_names else [f"Task {i}" for i in x]
 
+    fig, ax = plt.subplots(figsize=(8, 5))
     for i, (method, forg) in enumerate(forgetting.items()):
-        tasks = list(range(len(forg)))
         ax.plot(
-            tasks, forg,
-            marker=markers[i % len(markers)],
-            linewidth=1.8, markersize=6,
-            label=method,
+            range(len(forg)), forg,
+            marker=_MARKERS[i % len(_MARKERS)],
+            color=_METHOD_COLORS.get(method, _PALETTE[i % len(_PALETTE)]),
+            linewidth=2.0, markersize=7, label=method,
         )
 
-    ax.set_xlabel("Task index")
-    ax.set_ylabel("Forgetting")
-    ax.set_title("Forgetting per Task (higher = worse)")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.set_xlabel("Task", fontsize=11)
+    ax.set_ylabel("Forgetting  (↓ better)", fontsize=11)
+    ax.set_title("Forgetting per Task after Full Sequential Training", fontsize=12)
+    ax.set_xticks(range(n_tasks)); ax.set_xticklabels(xlabels)
+    ax.axhline(0, color="grey", linewidth=0.8, linestyle="--")
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(loc="best", fontsize=10, framealpha=0.9)
+    fig.tight_layout()
+    _save(fig, Path(save_path))
+
+
+def plot_comparison(
+    trackers: Dict[str, "MetricsTracker"],  # type: ignore[name-defined]
+    save_path: Optional[Path] = None,
+    task_names: Optional[List[str]] = None,
+    y_min_class_il: float = 0.0,
+    y_min_task_il: float = 0.5,
+) -> None:
+    """Single 3-panel figure: Class-IL accuracy, Task-IL accuracy, forgetting.
+
+    Produces a publication-quality side-by-side summary of all methods that
+    can be dropped directly into the report as a single figure.
+
+    Args:
+        trackers:       {method_name: MetricsTracker} — one entry per method.
+        save_path:      Where to save.  Defaults to imgs/comparison.png.
+        task_names:     x-axis tick labels, e.g. ["T0","T1","T2","T3","T4"].
+        y_min_class_il: Lower y-limit for Class-IL panel (default 0).
+        y_min_task_il:  Lower y-limit for Task-IL panel (default 0.5).
+    """
+    if save_path is None:
+        save_path = IMGS_DIR / "comparison.png"
+
+    n_tasks  = max(len(t.avg_acc_curve("class_il")) for t in trackers.values())
+    x        = list(range(1, n_tasks + 1))
+    xlabels  = task_names if task_names else [str(i) for i in x]
+    n_forg   = n_tasks - 1
+    xf       = list(range(n_forg))
+    xf_labels = task_names[:n_forg] if task_names else [f"T{i}" for i in xf]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    ax_c, ax_t, ax_f = axes
+
+    for i, (method, tracker) in enumerate(trackers.items()):
+        color  = _METHOD_COLORS.get(method, _PALETTE[i % len(_PALETTE)])
+        marker = _MARKERS[i % len(_MARKERS)]
+        kw     = dict(color=color, marker=marker, linewidth=2.0,
+                      markersize=7, label=method)
+
+        accs_c = tracker.avg_acc_curve("class_il")
+        accs_t = tracker.avg_acc_curve("task_il")
+        forg   = tracker.forgetting("class_il")
+
+        ax_c.plot(range(1, len(accs_c) + 1), accs_c, **kw)
+        ax_t.plot(range(1, len(accs_t) + 1), accs_t, **kw)
+        if forg:
+            ax_f.plot(range(len(forg)), forg, **kw)
+
+    pct = plt.FuncFormatter(lambda v, _: f"{v:.0%}")
+    dash_grid = dict(alpha=0.3, linestyle="--")
+
+    ax_c.set_title("Class-IL — Avg Accuracy", fontsize=11)
+    ax_c.set_xlabel("Tasks learned"); ax_c.set_ylabel("Avg accuracy")
+    ax_c.set_xticks(x); ax_c.set_xticklabels(xlabels)
+    ax_c.set_ylim(y_min_class_il, 1.02)
+    ax_c.yaxis.set_major_formatter(pct); ax_c.grid(**dash_grid)
+
+    ax_t.set_title("Task-IL — Avg Accuracy", fontsize=11)
+    ax_t.set_xlabel("Tasks learned"); ax_t.set_ylabel("Avg accuracy")
+    ax_t.set_xticks(x); ax_t.set_xticklabels(xlabels)
+    ax_t.set_ylim(y_min_task_il, 1.02)
+    ax_t.yaxis.set_major_formatter(pct); ax_t.grid(**dash_grid)
+
+    ax_f.set_title("Class-IL Forgetting  (↓ better)", fontsize=11)
+    ax_f.set_xlabel("Task"); ax_f.set_ylabel("Forgetting")
+    ax_f.set_xticks(xf); ax_f.set_xticklabels(xf_labels)
+    ax_f.axhline(0, color="grey", linewidth=0.8, linestyle="--")
+    ax_f.yaxis.set_major_formatter(pct); ax_f.grid(**dash_grid)
+
+    # Shared legend below the figure
+    handles, labels = ax_c.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(trackers),
+               fontsize=10, framealpha=0.9,
+               bbox_to_anchor=(0.5, -0.06))
+    fig.suptitle("Continual Learning — Seq-CIFAR-10 Comparison", fontsize=13, y=1.01)
+    fig.tight_layout()
+    _save(fig, Path(save_path))
+
+
+def plot_forgetting_heatmap(
+    trackers: Dict[str, "MetricsTracker"],  # type: ignore[name-defined]
+    scenario: str = "class_il",
+    save_path: Optional[Path] = None,
+    task_names: Optional[List[str]] = None,
+) -> None:
+    """Heatmap of per-task accuracy after each training step, one row per method.
+
+    The cell (method, task_j) shows the accuracy on task j *after all tasks
+    have been trained* — i.e. the last row of each method's accuracy matrix.
+    Darker = higher accuracy; missing cells (task not yet seen) are grey.
+
+    Args:
+        trackers:   {method_name: MetricsTracker}
+        scenario:   "class_il" or "task_il"
+        save_path:  Defaults to imgs/forgetting_heatmap_<scenario>.png
+        task_names: Column labels, e.g. ["T0","T1","T2","T3","T4"]
+    """
+    if save_path is None:
+        save_path = IMGS_DIR / f"forgetting_heatmap_{scenario}.png"
+
+    methods = list(trackers.keys())
+    n_tasks = max(len(t.avg_acc_curve(scenario)) for t in trackers.values())
+    xlabels = task_names if task_names else [f"Task {i}" for i in range(n_tasks)]
+
+    # Build matrix: rows = methods, cols = tasks, values = final accuracy
+    data = np.full((len(methods), n_tasks), np.nan)
+    for r, method in enumerate(methods):
+        mat        = trackers[method].acc_matrix(scenario)
+        final_row  = mat[-1]
+        for c, v in enumerate(final_row):
+            if not np.isnan(v):
+                data[r, c] = v
+
+    fig, ax = plt.subplots(figsize=(max(6, n_tasks * 1.4), max(3, len(methods) * 0.8 + 1)))
+    masked  = np.ma.array(data, mask=np.isnan(data))
+    cmap    = plt.cm.RdYlGn.copy(); cmap.set_bad(color="#cccccc")
+    im      = ax.imshow(masked, cmap=cmap, vmin=0, vmax=1, aspect="auto")
+
+    # Annotate each cell
+    for r in range(len(methods)):
+        for c in range(n_tasks):
+            if not np.isnan(data[r, c]):
+                val   = data[r, c]
+                color = "black" if 0.25 < val < 0.85 else "white"
+                ax.text(c, r, f"{val:.2f}", ha="center", va="center",
+                        fontsize=9, color=color)
+
+    ax.set_xticks(range(n_tasks)); ax.set_xticklabels(xlabels, fontsize=10)
+    ax.set_yticks(range(len(methods))); ax.set_yticklabels(methods, fontsize=10)
+    label = "Class-IL" if scenario == "class_il" else "Task-IL"
+    ax.set_title(f"{label} — Per-task accuracy after full training", fontsize=12)
+    plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02,
+                 format=plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
     fig.tight_layout()
     _save(fig, Path(save_path))
 
