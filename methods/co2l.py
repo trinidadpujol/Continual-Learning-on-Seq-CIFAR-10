@@ -1,43 +1,30 @@
 """
-Contrastive Continual Learning (Co²L) — full implementation.
+Contrastive Continual Learning (Co²L).
+Cha et al., ICCV 2021. https://arxiv.org/abs/2106.14413
 
-Reference: Cha et al., "Co²L: Contrastive Continual Learning", ICCV 2021.
-https://arxiv.org/abs/2106.14413
-
-Combined objective
-------------------
+Objetivo combinado:
     L = L_SupCon  +  λ · L_distill  +  L_CE
 
-  L_SupCon  — Supervised Contrastive loss on the JOINT batch:
-                (a) two-view current-task samples
-                (b) two views synthesised from single-view replay samples
-              Pulls same-class representations together across both present
-              and past tasks.
+  L_SupCon  — Contrastive supervisado sobre el batch CONJUNTO:
+                (a) dos vistas de samples de la tarea actual
+                (b) dos vistas sintetizadas de samples del replay buffer
+              Aproxima representaciones de la misma clase independientemente
+              de si son de la tarea actual o pasada.
 
-  L_distill — Asymmetric Distillation loss on the CURRENT-TASK batch only:
-                for each sample i, treats z_curr_i as an anchor and
-                z_prev_i (frozen teacher embedding) as the single positive;
-                all other z_prev_j are negatives.
-              Preserves the representation structure learned on past tasks.
-              Active only on tasks t > 0 (teacher = snapshot before task t).
+  L_distill — Asymmetric Distillation sobre samples de la tarea actual:
+                preserva la estructura de representaciones del modelo anterior.
+                Solo activo para t > 0 (teacher = snapshot antes de la tarea t).
 
-  L_CE      — CrossEntropy on view-0 of the current-task batch.
-              Keeps the linear classification head aligned with the new task.
+  L_CE      — Cross-entropy sobre la vista-0 de la tarea actual.
+              Mantiene alineada la cabeza de clasificación.
 
-Joint batch construction
-------------------------
-The SupCon loader yields two-view batches (B, 2, C, H, W) for the current
-task.  The replay buffer stores single-view tensors (saved with the standard
-transform in end_task).  A second buffer view is synthesised at runtime via
-random horizontal flip — sufficient augmentation for contrastive learning.
+Construcción del batch conjunto
+--------------------------------
+El loader SupCon produce batches (B, 2, C, H, W). El buffer guarda tensores de
+una sola vista; sintetizamos la segunda vista con flip horizontal aleatorio
+(suficiente como augmentación para el aprendizaje contrastivo).
 
-Replay is active from task 1 onward.  On task 0 the buffer is empty and the
-training is pure SupCon + CE, matching the Stage-2 pre-training setup.
-
-Buffer update
--------------
-end_task() calls buffer.update_from_loader() with the standard (single-view)
-task DataLoader.  Second views are generated lazily during training.
+El buffer se actualiza al terminar cada tarea con muestras de una sola vista.
 """
 
 from __future__ import annotations
@@ -57,25 +44,15 @@ from losses.supcon import SupConLoss
 from methods.base import BaseMethod
 from models.backbone import Backbone
 
-CO2L_LAMBDA = 1.0   # distillation weight λ
+CO2L_LAMBDA = 1.0   # peso λ del término de distilación
 SUPCON_TEMP = 0.07
 
 
 class Co2L(BaseMethod):
-    """Contrastive Continual Learning — full Co²L implementation.
+    """Implementación completa de Co²L (Cha et al. 2021).
 
-    Args:
-        backbone:      Backbone instance (encoder + projector + classifier).
-        device:        Torch device.
-        seq_cifar:     SeqCIFAR10 instance — provides the two-view SupCon
-                       loader for each task inside train_task().
-        replay_buffer: Fixed-capacity buffer (reservoir sampling).
-        co2l_lambda:   Weight λ for the distillation term.
-        temperature:   SupCon / distillation temperature τ.
-        lr:            SGD learning rate (0.5 as in the paper).
-        momentum:      SGD momentum.
-        weight_decay:  L2 regularisation.
-        n_buf_samples: Replay samples mixed into each SupCon batch.
+    Combina SupCon sobre batch conjunto (tarea actual + replay), destilación
+    asimétrica para preservar representaciones pasadas, y CE para la tarea actual.
     """
 
     uses_replay: bool = True
@@ -107,31 +84,23 @@ class Co2L(BaseMethod):
         self.distill_loss = AsymmetricDistillationLoss(temperature=temperature)
         self._prev_model: Optional[nn.Module] = None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     def begin_task(self, task_id: int) -> None:
-        """Snapshot the current model as the frozen teacher for distillation."""
+        """Snapshot del modelo actual como teacher frozen para la destilación."""
         super().begin_task(task_id)
         if task_id > 0:
             self._prev_model = copy.deepcopy(self.backbone).to(self.device)
             self._prev_model.eval()
             for p in self._prev_model.parameters():
                 p.requires_grad = False
-            self._log(f"teacher snapshot taken for task={task_id}")
+            self._log(f"teacher snapshot tomado para task={task_id}")
         else:
             self._prev_model = None
 
     def end_task(self, task_id: int, train_loader: DataLoader) -> None:
-        """Update replay buffer with single-view samples from the finished task."""
+        """Actualiza el replay buffer con samples de vista única de la tarea terminada."""
         super().end_task(task_id, train_loader)
         self.buffer.update_from_loader(train_loader, task_id)
-        self._log(f"buffer updated — {self.buffer}")
-
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
+        self._log(f"buffer actualizado — {self.buffer}")
 
     def train_task(
         self,
@@ -139,18 +108,10 @@ class Co2L(BaseMethod):
         train_loader: DataLoader,
         n_epochs: int = 500,
     ) -> Dict[str, list]:
-        """Train with SupCon + A-Distill + CE.
+        """Entrenamiento con SupCon + A-Distill + CE.
 
-        Args:
-            task_id:      0-based task index.
-            train_loader: Standard single-view DataLoader for task_id.
-                          Used for _validate_batch_labels and end_task;
-                          the two-view SupCon loader is built internally.
-            n_epochs:     Number of training epochs.
-
-        Returns:
-            {"supcon", "distill", "ce", "loss", "acc"} — one float per epoch.
-            "distill" is 0.0 on task 0 (no teacher yet).
+        train_loader es el loader estándar (una vista) para validación y end_task.
+        El loader SupCon (dos vistas) se construye internamente.
         """
         if self._current_task_id != task_id:
             self.begin_task(task_id)
@@ -163,6 +124,7 @@ class Co2L(BaseMethod):
             momentum=self.momentum,
             weight_decay=self.weight_decay,
         )
+        # Cosine annealing como en el paper original
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=n_epochs
         )
@@ -178,38 +140,39 @@ class Co2L(BaseMethod):
             correct = total = 0
 
             for x2v, labels_cur in supcon_loader:
-                # x2v: (B, 2, C, H, W)   labels_cur: (B,)
+                # x2v: (B, 2, C, H, W),  labels_cur: (B,)
                 self._validate_batch_labels(labels_cur, task_id)
                 x2v        = x2v.to(self.device)
                 labels_cur = labels_cur.to(self.device)
                 B          = labels_cur.size(0)
 
-                # ── 1. SupCon on joint batch ──────────────────────────────
+                # 1. SupCon sobre batch conjunto (tarea actual + replay buffer)
                 feats_cur = self.backbone.forward_supcon(x2v)   # (B, 2, proj_dim)
 
                 if len(self.buffer) > 0:
                     buf_imgs, buf_labels = self.buffer.sample(self.n_buf_samples)
                     buf_imgs   = buf_imgs.to(self.device)
                     buf_labels = buf_labels.to(self.device)
-                    buf_v2     = _random_flip(buf_imgs)
-                    buf_2v     = torch.stack([buf_imgs, buf_v2], dim=1)  # (N,2,C,H,W)
-                    feats_buf  = self.backbone.forward_supcon(buf_2v)    # (N,2,proj_dim)
+                    # Segunda vista del buffer: flip horizontal (augmentación simple)
+                    buf_v2    = _random_flip(buf_imgs)
+                    buf_2v    = torch.stack([buf_imgs, buf_v2], dim=1)  # (N,2,C,H,W)
+                    feats_buf = self.backbone.forward_supcon(buf_2v)    # (N,2,proj_dim)
                     joint_feats  = torch.cat([feats_cur, feats_buf], dim=0)
-                    joint_labels = torch.cat([labels_cur, buf_labels],   dim=0)
+                    joint_labels = torch.cat([labels_cur, buf_labels],  dim=0)
                 else:
                     joint_feats  = feats_cur
                     joint_labels = labels_cur
 
                 supcon = self.supcon_loss(joint_feats, joint_labels)
 
-                # ── 2. Asymmetric Distillation on current-task samples ────
-                distill = self._compute_distillation(x2v[:, 0])   # view-0
+                # 2. Destilación asimétrica sobre samples de la tarea actual (vista-0)
+                distill = self._compute_distillation(x2v[:, 0])
 
-                # ── 3. CE on current-task (view-0) ────────────────────────
+                # 3. CE sobre la tarea actual (vista-0)
                 logits_cur = self.backbone(x2v[:, 0])
                 ce         = ce_criterion(logits_cur, labels_cur)
 
-                # ── 4. Combined loss ──────────────────────────────────────
+                # 4. Loss combinada
                 loss = supcon + self.co2l_lambda * distill + ce
 
                 optimizer.zero_grad()
@@ -234,47 +197,26 @@ class Co2L(BaseMethod):
 
         return log
 
-    # ------------------------------------------------------------------
-    # Distillation helper
-    # ------------------------------------------------------------------
-
     def _compute_distillation(self, imgs: torch.Tensor) -> torch.Tensor:
-        """Compute A-Distill between current and frozen-teacher encoder outputs.
+        """A-Distill entre features del modelo actual y el teacher frozen.
 
-        Uses backbone.encode() — L2-normalised encoder features (not the
-        projector), so the distillation operates in the same space used for
-        downstream classification.
-
-        Args:
-            imgs: (B, C, H, W) single-view current-task batch, on device.
-
-        Returns:
-            Scalar distillation loss; 0.0 if no teacher (task 0).
+        Usamos backbone.encode() (features del encoder, no del projector) porque
+        es el espacio que se usa para clasificación downstream.
+        Devuelve 0.0 si no hay teacher (tarea 0).
         """
         if self._prev_model is None:
             return torch.tensor(0.0, device=self.device)
 
-        z_curr = self.backbone.encode(imgs)          # (B, feat_dim), L2-norm
+        z_curr = self.backbone.encode(imgs)
 
         with torch.no_grad():
-            z_prev = self._prev_model.encode(imgs)   # (B, feat_dim), frozen
+            z_prev = self._prev_model.encode(imgs)
 
         return self.distill_loss(z_curr, z_prev)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ──────────────────────────────────────────────────────────────────────────────
-
 def _random_flip(imgs: torch.Tensor) -> torch.Tensor:
-    """Apply independent random horizontal flip to each image (p=0.5).
-
-    Args:
-        imgs: (B, C, H, W) tensor.
-
-    Returns:
-        (B, C, H, W) tensor.
-    """
+    """Flip horizontal aleatorio e independiente por imagen (p=0.5)."""
     mask = torch.rand(imgs.size(0), device=imgs.device) > 0.5
     out  = imgs.clone()
     if mask.any():

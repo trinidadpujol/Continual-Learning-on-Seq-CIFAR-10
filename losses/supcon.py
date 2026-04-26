@@ -1,36 +1,19 @@
 """
-Supervised Contrastive Loss (SupCon).
-
-Reference: Khosla et al., "Supervised Contrastive Learning", NeurIPS 2020.
+Supervised Contrastive Loss (Khosla et al., NeurIPS 2020).
 https://arxiv.org/abs/2004.11362
 
-Algorithm (per anchor i)
-------------------------
-Given N samples each with n_views augmented views, we work on the
-2·N × feat_dim "contrast" matrix — every view of every sample is an anchor
-in turn.
+Para cada anchor i en la matriz de contraste (2B x feat_dim):
+  - positivos: todas las vistas de imágenes de la misma clase (supervised)
+               o solo la otra vista del mismo sample (SimCLR, sin labels)
+  - negativos: todo el resto
 
-For anchor i:
-  - positives: all other views of the same image AND all views of images
-               with the same class label (Supervised) — or only the other
-               augmented view of the same image (SimCLR / label-free).
-  - negatives: all remaining views.
+Loss por anchor i:
+    ℓ_i = -1/|P(i)| · Σ_{p∈P(i)} log [ exp(z_i·z_p/τ) / Σ_{a≠i} exp(z_i·z_a/τ) ]
 
-Loss for anchor i:
-    ℓ_i = -1/|P(i)| · Σ_{p∈P(i)} log [
-        exp(z_i · z_p / τ) /
-        Σ_{a≠i} exp(z_i · z_a / τ)
-    ]
+Estabilidad numérica: restamos el max de cada fila antes de exp (log-sum-exp trick).
 
-Numerical stability: we subtract max(logits) before exp — standard
-log-sum-exp trick.  Diagonal self-similarity is masked out before the
-denominator sum.
-
-Reuse in Co²L
--------------
-Co²L reuses SupConLoss directly with the combined
-[current-task batch + replay-buffer samples] feature matrix.  The
-`labels` argument handles the positive-pair mask automatically.
+En Co²L reutilizamos esta misma clase con el batch conjunto
+(tarea actual + replay buffer), los labels se encargan del masking.
 """
 
 from __future__ import annotations
@@ -41,13 +24,10 @@ import torch.nn.functional as F
 
 
 class SupConLoss(nn.Module):
-    """Supervised (or self-supervised) Contrastive Loss.
+    """Supervised Contrastive Loss.
 
-    Args:
-        temperature: Logit-scale temperature τ (default 0.07, as in the paper).
-        base_temperature: Reference temperature used to re-scale the loss
-            magnitude (default 0.07). Set equal to temperature to disable
-            re-scaling.
+    features: (B, n_views, feat_dim) — ya L2-normalizadas, típicamente n_views=2.
+    labels:   (B,) enteros. Si None, cae al objetivo SimCLR (self-supervised).
     """
 
     def __init__(self, temperature: float = 0.07, base_temperature: float = 0.07):
@@ -60,52 +40,32 @@ class SupConLoss(nn.Module):
         features: torch.Tensor,
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute the SupCon loss.
-
-        Args:
-            features: (B, n_views, feat_dim) — **L2-normalised** projection
-                      vectors, e.g. from Backbone.forward_supcon().
-                      Typically n_views=2 (two augmented views).
-            labels:   (B,) integer class labels.  If None, falls back to the
-                      SimCLR self-supervised objective (only same-image pairs
-                      are positive).
-
-        Returns:
-            Scalar loss (mean over all valid anchors).
-
-        Raises:
-            ValueError: if features is not 3-dimensional or B < 2.
-        """
         if features.ndim != 3:
             raise ValueError(
-                f"features must be (B, n_views, feat_dim), got shape {features.shape}"
+                f"features debe ser (B, n_views, feat_dim), recibido {features.shape}"
             )
 
         B, n_views, feat_dim = features.shape
         device = features.device
 
         if B < 2:
-            raise ValueError("SupConLoss requires at least 2 samples per batch.")
+            raise ValueError("SupConLoss necesita al menos 2 samples por batch.")
 
-        # ── 1. Build the (2B, feat_dim) contrast matrix ─────────────────────
-        # Flatten: each of the B×n_views views becomes one row.
-        contrast = features.view(B * n_views, feat_dim)   # (2B, feat_dim)
+        # Aplanar a (2B, feat_dim): cada vista es una fila
+        contrast = features.view(B * n_views, feat_dim)
 
-        # ── 2. Pairwise cosine-similarity logits ─────────────────────────────
-        # Features are already L2-normalised → dot product = cosine similarity.
+        # Similitudes coseno (features ya L2-norm → dot product = cosine)
         sim = torch.matmul(contrast, contrast.T) / self.temperature  # (2B, 2B)
 
-        # ── 3. Mask: which pairs are positives? ──────────────────────────────
+        # Máscara de positivos
         if labels is not None:
-            # Supervised: positives are all views sharing the same class label.
-            # Repeat each label n_views times to align with the contrast matrix.
-            labels_rep = labels.repeat_interleave(n_views)  # (2B,)
+            # Supervised: positivos = todas las vistas de la misma clase
+            labels_rep = labels.repeat_interleave(n_views)
             label_mask = torch.eq(
                 labels_rep.unsqueeze(0), labels_rep.unsqueeze(1)
-            ).float().to(device)                             # (2B, 2B)
+            ).float().to(device)
         else:
-            # SimCLR: only the other augmented view of the same image is positive.
-            # Indices 2i and 2i+1 are the two views of sample i.
+            # SimCLR: solo la otra vista del mismo sample
             label_mask = torch.zeros(B * n_views, B * n_views, device=device)
             for i in range(B):
                 for vi in range(n_views):
@@ -113,35 +73,27 @@ class SupConLoss(nn.Module):
                         if vi != vj:
                             label_mask[i * n_views + vi, i * n_views + vj] = 1.0
 
-        # Exclude self-similarity from both positives and negatives.
+        # Excluir diagonal (self-similarity) de positivos y denominador
         eye = torch.eye(B * n_views, device=device)
-        pos_mask = label_mask * (1 - eye)   # same-label pairs, no diagonal
-        neg_mask = 1 - label_mask           # different-label pairs (includes off-diag)
-        # All valid denominator entries: everyone except self.
-        denom_mask = 1 - eye               # (2B, 2B)
+        pos_mask   = label_mask * (1 - eye)
+        denom_mask = 1 - eye
 
-        # ── 4. Numerically stable log-sum-exp ────────────────────────────────
-        # Subtract row max before exp to prevent overflow.
-        # Mask diagonal to -inf so it never contributes to the denominator.
-        sim_masked = sim - eye * 1e9            # diagonal → −∞ for denominator
+        # Log-sum-exp estable: restar max por fila antes de exp
+        sim_masked = sim - eye * 1e9
         max_sim    = sim_masked.max(dim=1, keepdim=True).values.detach()
-        exp_sim    = torch.exp(sim - max_sim)   # (2B, 2B)
+        exp_sim    = torch.exp(sim - max_sim)
 
-        # ── 5. Log-probability of each pair being a positive ─────────────────
-        # log_prob[i, j] = sim[i,j] - log( Σ_{k≠i} exp(sim[i,k]) )
-        denom      = (exp_sim * denom_mask).sum(dim=1, keepdim=True)   # (2B, 1)
-        log_prob   = (sim - max_sim) - torch.log(denom + 1e-9)         # (2B, 2B)
+        # log p(par positivo)
+        denom    = (exp_sim * denom_mask).sum(dim=1, keepdim=True)
+        log_prob = (sim - max_sim) - torch.log(denom + 1e-9)
 
-        # ── 6. Mean log-probability over positive pairs for each anchor ───────
-        n_pos = pos_mask.sum(dim=1)                           # (2B,) positive count
-        valid = n_pos > 0                                     # anchors with ≥1 positive
-
-        # Avoid division by zero for anchors that have no positives.
+        # Promedio sobre positivos por anchor (evitando división por cero)
+        n_pos      = pos_mask.sum(dim=1)
+        valid      = n_pos > 0
         n_pos_safe = n_pos.clamp(min=1)
-        mean_log_prob = (pos_mask * log_prob).sum(dim=1) / n_pos_safe  # (2B,)
+        mean_log_prob = (pos_mask * log_prob).sum(dim=1) / n_pos_safe
 
-        # ── 7. Final loss ────────────────────────────────────────────────────
-        # Optionally re-scale by temperature ratio (as in the official code).
+        # Rescaleo por temperatura como en el código oficial
         loss = -(self.temperature / self.base_temperature) * mean_log_prob
         loss = loss[valid].mean()
 

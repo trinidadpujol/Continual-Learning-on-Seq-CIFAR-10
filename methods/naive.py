@@ -1,11 +1,9 @@
 """
-Naive Fine-Tuning baseline.
+Naive Fine-Tuning (baseline / cota inferior).
 
-Simply re-trains the full model on each new task with cross-entropy loss,
-with no mechanism to mitigate catastrophic forgetting.
-This serves as the lower-bound reference for all other methods.
-
-Data protocol:  no replay — train_loader contains ONLY task-t samples.
+Reentrena el modelo completo con cross-entropy en cada tarea nueva, sin ningún
+mecanismo para mitigar el olvido catastrófico. Es lo que esperaríamos que pase
+si simplemente ignoramos el problema: el modelo olvida todo lo anterior.
 """
 
 from __future__ import annotations
@@ -21,14 +19,10 @@ from models.backbone import Backbone
 
 
 class NaiveFineTuning(BaseMethod):
-    """Fine-tune the full model on each task without any forgetting prevention.
+    """Fine-tuning secuencial sin ninguna mitigación del olvido.
 
-    Training loop contract
-    ----------------------
-    - Iterates only over the DataLoader passed in (task-t data exclusively).
-    - _validate_batch_labels() is called every batch — any stray label from
-      another task raises RuntimeError immediately.
-    - No buffer is consulted.
+    Sirve como baseline (cota inferior) para comparar contra los otros métodos.
+    Solo usa datos de la tarea actual, sin buffer de replay.
     """
 
     uses_replay: bool = False
@@ -52,18 +46,6 @@ class NaiveFineTuning(BaseMethod):
         train_loader: DataLoader,
         n_epochs: int = 50,
     ) -> Dict[str, list]:
-        """Train on task_id using only the provided DataLoader.
-
-        Args:
-            task_id:      Index of the current task (0-based).
-            train_loader: DataLoader whose samples belong to task_id only.
-            n_epochs:     Number of passes over the task data.
-
-        Returns:
-            {"loss": [float, ...], "acc": [float, ...]}  — one entry per epoch.
-        """
-        # begin_task sets _allowed_classes; call it here too in case the
-        # caller skipped the ContinualTrainer and invoked train_task directly.
         if self._current_task_id != task_id:
             self.begin_task(task_id)
 
@@ -79,11 +61,7 @@ class NaiveFineTuning(BaseMethod):
             total = 0
 
             for imgs, labels in train_loader:
-                # ── Protocol enforcement ──────────────────────────────────
-                # Every label in this batch must come from task_id's classes.
-                # Source: task DataLoader only — no buffer involved here.
                 self._validate_batch_labels(labels, task_id)
-                # ─────────────────────────────────────────────────────────
 
                 imgs   = imgs.to(self.device)
                 labels = labels.to(self.device)

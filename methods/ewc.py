@@ -1,33 +1,16 @@
 """
 Elastic Weight Consolidation (EWC).
+Kirkpatrick et al., PNAS 2017. https://arxiv.org/abs/1612.00796
 
-Reference: Kirkpatrick et al., "Overcoming catastrophic forgetting in neural
-networks", PNAS 2017. https://arxiv.org/abs/1612.00796
+Idea central: después de aprender la tarea t, estimamos la diagonal de la
+Fisher Information Matrix F_t y guardamos los parámetros óptimos θ*_t.
+Al entrenar t+1, penalizamos los cambios en parámetros que eran importantes:
 
-Algorithm
----------
-After completing task t, EWC:
-  1. Snapshots the current optimal parameters  θ*_t.
-  2. Estimates the diagonal of the Fisher Information Matrix F_t by
-     accumulating squared gradients of the log-likelihood (cross-entropy)
-     over the task-t training data.
+    L = L_CE  +  (λ/2) · Σ_prev_t  Σ_i  F_t_i · (θ_i - θ*_t_i)²
 
-When training on a subsequent task t+1, the loss becomes:
-    L = L_CE  +  (λ/2) * Σ_prev_t  Σ_i  F_t_i * (θ_i - θ*_t_i)^2
-
-The sum over previous tasks (online/accumulate mode) means each new task
-adds one more penalty term.  This is the "multi-head" variant: separate
-Fisher/optima per past task, summed together.
-
-Fisher estimation
------------------
-We use the empirical Fisher (squared gradients of the CE loss w.r.t. the
-current parameters, averaged over all batches):
-
-    F_i ≈ (1/N) Σ_n (∂ log p(y_n|x_n, θ) / ∂ θ_i)^2
-
-Computed with a single forward+backward pass per batch (no second-order
-computation required).
+Usamos la Fisher empírica (promedio de gradientes² sobre el dataset de la tarea),
+que es una aproximación de primer orden pero funciona bien en la práctica.
+El término de penalización se acumula para todas las tareas pasadas.
 """
 
 from __future__ import annotations
@@ -41,21 +24,14 @@ from torch.utils.data import DataLoader
 from methods.base import BaseMethod
 from models.backbone import Backbone
 
-EWC_LAMBDA = 400.0
+EWC_LAMBDA = 400.0  # λ=400 funcionó bien en nuestros experimentos con CIFAR-10
 
 
 class EWC(BaseMethod):
-    """Elastic Weight Consolidation continual learning method.
+    """EWC: regularización con Fisher diagonal acumulada por tarea.
 
-    Args:
-        backbone:    Backbone instance (full model, encoder + classifier).
-        device:      Torch device.
-        ewc_lambda:  Regularisation strength λ.  Higher values preserve past
-                     tasks more strongly at the cost of plasticity on new tasks.
-                     400 is a reasonable default for CIFAR-10 with ResNet-18.
-        lr:          SGD learning rate.
-        momentum:    SGD momentum.
-        weight_decay: L2 regularisation (separate from EWC penalty).
+    ewc_lambda controla el trade-off estabilidad/plasticidad. Valores más altos
+    preservan mejor las tareas pasadas pero dificultan aprender las nuevas.
     """
 
     uses_replay: bool = False
@@ -75,15 +51,9 @@ class EWC(BaseMethod):
         self.momentum     = momentum
         self.weight_decay = weight_decay
 
-        # One entry per completed past task.
-        # _fisher[t][name] = diagonal Fisher tensor  (same shape as param)
-        # _optima[t][name] = optimal parameter snapshot after task t
+        # Una entrada por tarea completada
         self._fisher: List[Dict[str, torch.Tensor]] = []
         self._optima: List[Dict[str, torch.Tensor]] = []
-
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
 
     def train_task(
         self,
@@ -91,17 +61,6 @@ class EWC(BaseMethod):
         train_loader: DataLoader,
         n_epochs: int = 50,
     ) -> Dict[str, list]:
-        """Train with CE loss + EWC penalty from all previously seen tasks.
-
-        Args:
-            task_id:      0-based task index.
-            train_loader: DataLoader containing only task_id's samples.
-            n_epochs:     Number of epochs.
-
-        Returns:
-            {"loss": [...], "acc": [...], "penalty": [...]}
-            One entry per epoch; "penalty" is the EWC term (0 on task 0).
-        """
         if self._current_task_id != task_id:
             self.begin_task(task_id)
 
@@ -123,10 +82,10 @@ class EWC(BaseMethod):
                 labels = labels.to(self.device)
 
                 optimizer.zero_grad()
-                logits = self.backbone(imgs)
-                ce     = criterion(logits, labels)
+                logits  = self.backbone(imgs)
+                ce      = criterion(logits, labels)
                 penalty = self._ewc_penalty()
-                loss   = ce + (self.ewc_lambda / 2.0) * penalty
+                loss    = ce + (self.ewc_lambda / 2.0) * penalty
 
                 loss.backward()
                 optimizer.step()
@@ -147,27 +106,14 @@ class EWC(BaseMethod):
 
         return log
 
-    # ------------------------------------------------------------------
-    # Post-task: Fisher estimation and parameter snapshot
-    # ------------------------------------------------------------------
-
     def end_task(self, task_id: int, train_loader: DataLoader) -> None:
-        """Estimate Fisher diagonal and snapshot parameters after task_id.
-
-        Uses the empirical Fisher: squared gradients of the CE loss averaged
-        over all batches of the completed task.
-
-        Args:
-            task_id:      Index of the just-completed task.
-            train_loader: DataLoader for the task-t training data (used to
-                          compute the Fisher estimate on task-t distribution).
-        """
+        """Estima la Fisher diagonal y guarda snapshot de parámetros al terminar la tarea."""
         super().end_task(task_id, train_loader)
 
         self.backbone.eval()
         criterion = nn.CrossEntropyLoss()
 
-        # Accumulate squared gradients
+        # Acumulamos gradientes² sobre todos los batches de la tarea
         fisher_diag: Dict[str, torch.Tensor] = {
             name: torch.zeros_like(param)
             for name, param in self.backbone.named_parameters()
@@ -190,12 +136,11 @@ class EWC(BaseMethod):
 
             n_batches += 1
 
-        # Average over batches
         n_batches = max(n_batches, 1)
         for name in fisher_diag:
             fisher_diag[name] /= n_batches
 
-        # Snapshot current optimal parameters (detached, on CPU to save memory)
+        # Snapshot de parámetros óptimos (en CPU para ahorrar memoria)
         optima: Dict[str, torch.Tensor] = {
             name: param.detach().clone()
             for name, param in self.backbone.named_parameters()
@@ -211,15 +156,8 @@ class EWC(BaseMethod):
             f"tasks accumulated={len(self._fisher)}"
         )
 
-    # ------------------------------------------------------------------
-    # EWC penalty
-    # ------------------------------------------------------------------
-
     def _ewc_penalty(self) -> torch.Tensor:
-        """Compute Σ_prev_tasks Σ_params F_i * (θ_i - θ*_i)^2.
-
-        Returns a scalar tensor (0 if no past tasks).
-        """
+        """Calcula Σ_prev_tasks Σ_params F_i · (θ_i - θ*_i)². Devuelve 0 si no hay tareas pasadas."""
         if not self._fisher:
             return torch.tensor(0.0, device=self.device)
 

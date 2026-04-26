@@ -1,26 +1,13 @@
 """
-ContinualTrainer — orchestrates the sequential task-by-task training protocol.
+ContinualTrainer: orquesta el entrenamiento secuencial tarea por tarea.
 
-Responsibilities
-----------------
-1. For each task t, obtain a DataLoader for task t ONLY via
-   seq_cifar.get_task_loader(t).  Past task loaders are never created here.
+Por cada tarea t:
+  1. Construye un DataLoader solo para la tarea t (nunca crea loaders de tareas pasadas).
+  2. Llama begin_task → train_task → end_task en orden.
+  3. Llama eval_fn (si se provee) para registrar métricas Class-IL y Task-IL.
 
-2. Call method.begin_task(t) → method.train_task(t, loader, n_epochs)
-   → method.end_task(t, loader) in order, with no overlap between tasks.
-
-3. Collect per-task training logs and per-task/per-method evaluation results
-   into a structured results dictionary.
-
-4. Log the data source for every task so it is auditable in the notebook
-   output (class names, split size, whether replay is active).
-
-Replay contract
----------------
-- ContinualTrainer never touches the ReplayBuffer directly.
-- Replay-enabled methods (uses_replay=True) sample from their own buffer
-  inside train_task / end_task — ContinualTrainer only announces this in logs.
-- Past task DataLoaders are never passed to any method.
+Los métodos con replay acceden a datos pasados exclusivamente a través de su
+propio buffer interno. ContinualTrainer no toca el buffer directamente.
 """
 
 from __future__ import annotations
@@ -34,22 +21,17 @@ from methods.base import BaseMethod
 
 logger = logging.getLogger(__name__)
 
-
-# Type alias: callable that receives (task_id, method) and returns a metrics dict.
 EvalFn = Callable[[int, BaseMethod], Dict[str, float]]
 
 
 class ContinualTrainer:
-    """Orchestrates continual learning training across all tasks.
+    """Orquestador del protocolo de aprendizaje continuo secuencial.
 
-    Args:
-        method:    A concrete BaseMethod subclass to train.
-        seq_cifar: Configured SeqCIFAR10 instance (provides task-split loaders).
-        n_epochs:  Number of training epochs per task.
-        eval_fn:   Optional callable ``eval_fn(task_id, method) -> metrics_dict``
-                   called after each task finishes.  Receives the task index
-                   (0-based, tasks seen so far = 0..task_id) and the method.
-                   Useful to evaluate Class-IL / Task-IL after every task.
+    method:    Instancia concreta de BaseMethod.
+    seq_cifar: Dataset configurado con la división en tareas.
+    n_epochs:  Épocas de entrenamiento por tarea.
+    eval_fn:   Función opcional eval_fn(task_id, method) → métricas, llamada
+               después de cada tarea para registrar Class-IL y Task-IL.
     """
 
     def __init__(
@@ -64,31 +46,20 @@ class ContinualTrainer:
         self.n_epochs  = n_epochs
         self.eval_fn   = eval_fn
 
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
     def train_all_tasks(self) -> Dict[str, object]:
-        """Run the full sequential training protocol.
+        """Ejecuta el protocolo completo de entrenamiento secuencial.
 
-        For each task t:
-          - Creates a DataLoader for task t ONLY (no past loaders created).
-          - Calls begin_task → train_task → end_task.
-          - Optionally evaluates and records metrics.
+        Para cada tarea crea el loader correspondiente (solo esa tarea) y corre
+        el ciclo begin_task → train_task → end_task. Registra logs y tiempos.
 
-        Returns:
-            {
-              "train_logs":   {task_id: {"loss": [...], "acc": [...]}},
-              "eval_results": {task_id: metrics_dict},   # empty if no eval_fn
-              "task_times":   {task_id: seconds_float},
-            }
+        Devuelve dict con train_logs, eval_results y task_times.
         """
         train_logs:   Dict[int, Dict] = {}
         eval_results: Dict[int, Dict] = {}
         task_times:   Dict[int, float] = {}
 
-        n_tasks      = self.seq_cifar.n_tasks
-        method_name  = type(self.method).__name__
+        n_tasks     = self.seq_cifar.n_tasks
+        method_name = type(self.method).__name__
 
         print(f"\n{'='*60}")
         print(f"  ContinualTrainer — {method_name}")
@@ -107,31 +78,26 @@ class ContinualTrainer:
             print(f"  Data source : get_task_loader(task_id={task_id}, train=True)")
             print(f"  Past data   : {'ReplayBuffer only' if self.method.uses_replay and task_id > 0 else 'none'}")
 
-            # ── Obtain the loader for the current task ONLY ───────────
+            # Solo se crea el loader de la tarea actual
             train_loader = self.seq_cifar.get_task_loader(task_id, train=True)
-            # Past task loaders are deliberately NOT created here.
-            # ─────────────────────────────────────────────────────────
 
             logger.info(
                 "[ContinualTrainer] task=%d  method=%s  loader_classes=%s  replay=%s",
                 task_id, method_name, class_names, self.method.uses_replay,
             )
 
-            # ── Training lifecycle ────────────────────────────────────
             self.method.begin_task(task_id)
             log = self.method.train_task(task_id, train_loader, self.n_epochs)
             self.method.end_task(task_id, train_loader)
-            # ─────────────────────────────────────────────────────────
 
             elapsed = time.perf_counter() - t_start
-            train_logs[task_id]  = log
-            task_times[task_id]  = elapsed
+            train_logs[task_id] = log
+            task_times[task_id] = elapsed
 
             final_loss = log["loss"][-1] if log.get("loss") else float("nan")
             final_acc  = log["acc"][-1]  if log.get("acc")  else float("nan")
             print(f"  Done in {elapsed:.1f}s — final loss={final_loss:.4f}  acc={final_acc:.3f}")
 
-            # ── Optional evaluation after each task ───────────────────
             if self.eval_fn is not None:
                 metrics = self.eval_fn(task_id, self.method)
                 eval_results[task_id] = metrics
@@ -146,10 +112,6 @@ class ContinualTrainer:
             "eval_results": eval_results,
             "task_times":   task_times,
         }
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _print_eval(task_id: int, metrics: Dict[str, float]) -> None:

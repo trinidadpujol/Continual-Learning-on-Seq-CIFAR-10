@@ -1,31 +1,19 @@
 """
 Learning without Forgetting (LwF).
+Li & Hoiem, TPAMI 2018. https://arxiv.org/abs/1606.09282
 
-Reference: Li & Hoiem, "Learning without Forgetting", TPAMI 2018.
-https://arxiv.org/abs/1606.09282
+Antes de entrenar la tarea t (t > 0), guardamos un snapshot frozen del modelo
+como "teacher". Durante el entrenamiento usamos sus predicciones como soft targets:
 
-Algorithm
----------
-Before starting task t (t > 0):
-  - Snapshot the current model as a frozen "teacher" f_θ_prev.
+    L = L_CE(nueva tarea) + α · L_distill
 
-While training on task t:
-  - For each batch x from task-t loader:
-      1. Compute soft teacher targets:  p_prev = softmax(f_θ_prev(x) / T)
-      2. Compute student soft outputs:  p_curr = log_softmax(f_θ(x) / T)
-      3. Distillation loss:  L_dist = T² · KL(p_prev ‖ p_curr)
-                                     = T² · Σ p_prev · (log p_prev − p_curr)
-      4. CE loss on new task: L_ce = CrossEntropy(f_θ(x), y)
-      5. Combined: L = L_ce + α · L_dist
+donde L_distill = T² · KL(softmax(teacher/T) ‖ log_softmax(student/T))
 
-  The T² factor (temperature squared) re-scales the soft-target gradient
-  magnitude to match the hard-target gradient scale (Hinton et al. 2015).
+El factor T² reescala el gradiente de los soft targets para que tenga la misma
+magnitud que el de los hard targets (Hinton et al., 2015).
 
-Task 0 has no previous model, so L_dist = 0 (pure CE).
-
-Distillation covers ALL 10 logit dimensions, not just the old task classes.
-This forces the new model to preserve the full output distribution of the
-previous model on new-task inputs — a strong and simple regulariser.
+La destilación se hace sobre todos los 10 logits, no solo los de la tarea anterior,
+lo que obliga al modelo a preservar la distribución completa del teacher.
 """
 
 from __future__ import annotations
@@ -41,23 +29,15 @@ from torch.utils.data import DataLoader
 from methods.base import BaseMethod
 from models.backbone import Backbone
 
-LWF_ALPHA       = 1.0    # distillation loss weight
-LWF_TEMPERATURE = 2.0    # softmax temperature for soft targets
+LWF_ALPHA       = 1.0   # peso de la pérdida de destilación
+LWF_TEMPERATURE = 2.0   # temperatura para los soft targets
 
 
 class LwF(BaseMethod):
-    """Learning without Forgetting continual learning method.
+    """Learning without Forgetting: destilación de conocimiento sin acceso a datos anteriores.
 
-    Args:
-        backbone:    Backbone instance (full model).
-        device:      Torch device.
-        alpha:       Weight of the distillation loss relative to CE.
-                     α=1.0 balances both terms equally.
-        temperature: Softmax temperature T for producing soft targets.
-                     Higher T → softer probability distributions.
-        lr:          SGD learning rate.
-        momentum:    SGD momentum.
-        weight_decay: L2 regularisation.
+    alpha controla el balance entre aprender la nueva tarea y preservar las anteriores.
+    temperature suaviza las distribuciones del teacher (más alto = más suave).
     """
 
     uses_replay: bool = False
@@ -80,16 +60,10 @@ class LwF(BaseMethod):
         self.weight_decay = weight_decay
         self._prev_model: Optional[nn.Module] = None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     def begin_task(self, task_id: int) -> None:
-        """Snapshot the current model as a frozen teacher before task t.
+        """Snapshot del modelo actual como teacher frozen antes de la tarea t.
 
-        On task 0 no teacher exists, so distillation is skipped entirely.
-        On task t > 0 a deep copy is frozen (requires_grad=False, eval mode).
-        The teacher is moved to the training device but never updated.
+        En la tarea 0 no hay teacher, así que L_distill = 0 (solo CE).
         """
         super().begin_task(task_id)
         if task_id > 0:
@@ -97,13 +71,9 @@ class LwF(BaseMethod):
             self._prev_model.eval()
             for p in self._prev_model.parameters():
                 p.requires_grad = False
-            self._log(f"teacher snapshot taken for task={task_id}")
+            self._log(f"teacher snapshot tomado para task={task_id}")
         else:
             self._prev_model = None
-
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
 
     def train_task(
         self,
@@ -111,17 +81,6 @@ class LwF(BaseMethod):
         train_loader: DataLoader,
         n_epochs: int = 50,
     ) -> Dict[str, list]:
-        """Train with CE loss + knowledge distillation from the previous model.
-
-        Args:
-            task_id:      0-based task index.
-            train_loader: DataLoader containing only task_id's samples.
-            n_epochs:     Number of epochs.
-
-        Returns:
-            {"loss": [...], "acc": [...], "ce": [...], "distill": [...]}
-            One entry per epoch.  "distill" is 0.0 on task 0.
-        """
         if self._current_task_id != task_id:
             self.begin_task(task_id)
 
@@ -145,7 +104,7 @@ class LwF(BaseMethod):
 
                 optimizer.zero_grad()
 
-                logits = self.backbone(imgs)          # (B, num_classes)
+                logits = self.backbone(imgs)
                 ce     = criterion(logits, labels)
 
                 distill = self._distillation_loss(imgs, logits)
@@ -170,39 +129,27 @@ class LwF(BaseMethod):
 
         return log
 
-    # ------------------------------------------------------------------
-    # Distillation loss
-    # ------------------------------------------------------------------
-
     def _distillation_loss(
         self,
         imgs: torch.Tensor,
         student_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """KL-divergence distillation from the frozen teacher.
+        """KL divergence entre el teacher frozen y el student a temperatura T.
 
-        L_dist = T² · KL( softmax(z_teacher/T) ‖ log_softmax(z_student/T) )
-               = T² · Σ_c  p_teacher_c · (log p_teacher_c − log p_student_c)
+        L_dist = T² · KL(softmax(z_teacher/T) ‖ log_softmax(z_student/T))
 
-        Args:
-            imgs:           (B, C, H, W) batch already on device.
-            student_logits: (B, num_classes) student logits (already computed).
-
-        Returns:
-            Scalar distillation loss (0.0 if no teacher).
+        Devuelve 0.0 si no hay teacher (tarea 0).
         """
         if self._prev_model is None:
             return torch.tensor(0.0, device=self.device)
 
         T = self.temperature
         with torch.no_grad():
-            teacher_logits = self._prev_model(imgs)           # (B, num_classes)
+            teacher_logits = self._prev_model(imgs)
 
-        # Soft teacher targets
-        p_teacher = F.softmax(teacher_logits / T, dim=1)     # (B, num_classes)
-        # Log-softmax of student at same temperature
+        p_teacher     = F.softmax(teacher_logits / T, dim=1)
         log_p_student = F.log_softmax(student_logits / T, dim=1)
 
-        # KL divergence: mean over batch, T² rescaling
+        # Factor T² para reescalar el gradiente (Hinton et al. 2015)
         distill = F.kl_div(log_p_student, p_teacher, reduction="batchmean") * (T ** 2)
         return distill

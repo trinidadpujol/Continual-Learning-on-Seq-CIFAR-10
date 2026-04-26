@@ -1,10 +1,8 @@
 """
-Sequential CIFAR-10 dataset for continual learning.
+Seq-CIFAR-10: CIFAR-10 dividido en 5 tareas secuenciales de 2 clases cada una.
 
-Splits CIFAR-10 into N sequential tasks (default N=5), each with 2 classes.
-
-Data loading uses torchvision's CIFAR-10 (downloads automatically on first run).
-The replay buffer lives in data.buffer; it is re-exported here for convenience.
+Usamos torchvision para descargar CIFAR-10 la primera vez. Guardamos los índices
+por tarea para armar DataLoaders rápido sin recargar todo el dataset cada vez.
 """
 
 from __future__ import annotations
@@ -15,8 +13,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
-from data.constants import TASK_CLASSES, CLASS_NAMES  # noqa: F401 (re-exported)
-from data.buffer import ReplayBuffer  # noqa: F401 (re-exported)
+from data.constants import TASK_CLASSES, CLASS_NAMES  # noqa: F401
+from data.buffer import ReplayBuffer  # noqa: F401
 
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD  = (0.2470, 0.2435, 0.2616)
@@ -37,7 +35,7 @@ def get_transforms(train: bool = True) -> transforms.Compose:
 
 
 def get_supcon_transforms() -> "TwoViewTransform":
-    """Two-view augmentation transform for Supervised Contrastive Learning."""
+    """Augmentaciones para SupCon: dos vistas aleatorias de la misma imagen."""
     augment = transforms.Compose([
         transforms.RandomResizedCrop(32, scale=(0.2, 1.0)),
         transforms.RandomHorizontalFlip(),
@@ -50,9 +48,9 @@ def get_supcon_transforms() -> "TwoViewTransform":
 
 
 class TwoViewTransform:
-    """Applies the same augmentation twice to get two views of the same image.
+    """Aplica la misma augmentación dos veces para obtener dos vistas de la imagen.
 
-    Returns a tensor of shape (2, C, H, W) so DataLoader batches to (B, 2, C, H, W).
+    Devuelve un tensor (2, C, H, W) → el DataLoader produce batches (B, 2, C, H, W).
     """
 
     def __init__(self, transform: transforms.Compose):
@@ -61,14 +59,14 @@ class TwoViewTransform:
     def __call__(self, x) -> torch.Tensor:
         v1 = self.transform(x)
         v2 = self.transform(x)
-        return torch.stack([v1, v2])  # (2, C, H, W)
+        return torch.stack([v1, v2])
 
 
 class _TransformSubset(Dataset):
-    """Wraps a raw (no-transform) CIFAR-10 dataset at specific indices with a transform.
+    """Subconjunto del dataset CIFAR-10 crudo (PIL) con transform lazy.
 
-    Keeps the base dataset in PIL-image form so any transform can be applied
-    lazily, including TwoViewTransform for SupCon.
+    Necesitamos mantener las imágenes en PIL para poder aplicar distintos
+    transforms (incluyendo TwoViewTransform para SupCon).
     """
 
     def __init__(
@@ -85,21 +83,20 @@ class _TransformSubset(Dataset):
         return len(self._indices)
 
     def __getitem__(self, idx: int):
-        img, label = self._base[self._indices[idx]]  # img is PIL Image
+        img, label = self._base[self._indices[idx]]
         return self._transform(img), label
 
 
 class SeqCIFAR10:
     """
-    Sequential CIFAR-10 for continual learning.
+    CIFAR-10 secuencial para aprendizaje continuo.
 
-    Downloads CIFAR-10 via torchvision on first use (stored under data_root).
-    Pre-computes per-task index lists so DataLoaders are built in O(1).
+    Divide las 10 clases en N tareas (default 5), 2 clases por tarea.
+    Pre-computa los índices de cada tarea para construir DataLoaders en O(1).
 
-    Usage:
+    Ejemplo de uso:
         seq = SeqCIFAR10(data_root="./data", n_tasks=5)
-        train_loader = seq.get_task_loader(task_id=0, train=True)
-        test_loader  = seq.get_task_loader(task_id=0, train=False)
+        loader = seq.get_task_loader(task_id=0, train=True)
         supcon_loader = seq.get_task_loader(task_id=0, train=True, supcon=True)
     """
 
@@ -119,11 +116,10 @@ class SeqCIFAR10:
         self.num_workers = num_workers
         self.task_classes = TASK_CLASSES[:n_tasks]
 
-        # Load raw datasets (no transform — PIL images) and download if needed
+        # Cargamos sin transform para poder aplicarlo lazy (PIL images)
         self._raw_train = datasets.CIFAR10(data_root, train=True,  download=True, transform=None)
         self._raw_test  = datasets.CIFAR10(data_root, train=False, download=True, transform=None)
 
-        # Pre-compute per-task index lists from the integer target arrays
         train_targets = torch.tensor(self._raw_train.targets)
         test_targets  = torch.tensor(self._raw_test.targets)
 
@@ -137,32 +133,21 @@ class SeqCIFAR10:
             test_mask = (test_targets == c0) | (test_targets == c1)
             self._test_indices.append(test_mask.nonzero(as_tuple=True)[0].tolist())
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def get_task_loader(
         self,
         task_id: int,
         train: bool = True,
         supcon: bool = False,
     ) -> DataLoader:
-        """Return a DataLoader restricted to the two classes of task_id.
+        """DataLoader restringido a las dos clases de task_id.
 
-        Args:
-            task_id: 0-indexed task number (0..n_tasks-1).
-            train:   True for the training split, False for test.
-            supcon:  If True, applies TwoViewTransform and returns
-                     batches of shape (B, 2, C, H, W) for SupCon pre-training.
-                     Only valid when train=True.
-
-        Returns:
-            DataLoader yielding (images, labels) batches.
+        supcon=True devuelve batches (B, 2, C, H, W) para el pre-entrenamiento contrastivo.
+        Solo tiene sentido con train=True.
         """
         if task_id < 0 or task_id >= self.n_tasks:
             raise ValueError(f"task_id must be in [0, {self.n_tasks - 1}], got {task_id}")
         if supcon and not train:
-            raise ValueError("supcon=True is only valid for the training split")
+            raise ValueError("supcon=True solo es válido para el split de entrenamiento")
 
         if train:
             transform = get_supcon_transforms() if supcon else get_transforms(train=True)
@@ -180,16 +165,12 @@ class SeqCIFAR10:
         )
 
     def get_classes(self, task_id: int) -> Tuple[int, int]:
-        """Return the (class_a, class_b) integer pair for the given task."""
         return self.task_classes[task_id]
 
     def get_class_names(self, task_id: int) -> Tuple[str, str]:
-        """Return the human-readable class names for the given task."""
         c0, c1 = self.task_classes[task_id]
         return CLASS_NAMES[c0], CLASS_NAMES[c1]
 
     def task_size(self, task_id: int, train: bool = True) -> int:
-        """Number of samples in a task split."""
         indices = self._train_indices if train else self._test_indices
         return len(indices[task_id])
-
