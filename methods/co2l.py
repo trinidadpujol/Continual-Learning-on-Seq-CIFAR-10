@@ -153,17 +153,26 @@ class Co2L(BaseMethod):
                     buf_imgs, buf_labels = self.buffer.sample(self.n_buf_samples)
                     buf_imgs   = buf_imgs.to(self.device)
                     buf_labels = buf_labels.to(self.device)
-                    # Segunda vista del buffer: flip horizontal (augmentación simple)
-                    buf_v2    = _random_flip(buf_imgs)
-                    buf_2v    = torch.stack([buf_imgs, buf_v2], dim=1)  # (N,2,C,H,W)
-                    feats_buf = self.backbone.forward_supcon(buf_2v)    # (N,2,proj_dim)
-                    joint_feats  = torch.cat([feats_cur, feats_buf], dim=0)
-                    joint_labels = torch.cat([labels_cur, buf_labels],  dim=0)
+                    N = buf_labels.size(0)
+
+                    # Buffer como negativos de una sola vista: se proyectan una vez
+                    # y se expanden a (N, 2, proj_dim) para compatibilidad con
+                    # SupConLoss, pero anchor_mask=False los excluye del numerador.
+                    feats_buf    = self.backbone.project(buf_imgs)               # (N, proj_dim)
+                    feats_buf_2v = feats_buf.unsqueeze(1).expand(-1, 2, -1).contiguous()  # (N, 2, proj_dim)
+
+                    joint_feats  = torch.cat([feats_cur, feats_buf_2v], dim=0)  # (B+N, 2, proj_dim)
+                    joint_labels = torch.cat([labels_cur, buf_labels],  dim=0)  # (B+N,)
+                    anchor_mask  = torch.cat([
+                        torch.ones(B,  dtype=torch.bool, device=self.device),
+                        torch.zeros(N, dtype=torch.bool, device=self.device),
+                    ])
                 else:
                     joint_feats  = feats_cur
                     joint_labels = labels_cur
+                    anchor_mask  = None
 
-                supcon = self.supcon_loss(joint_feats, joint_labels)
+                supcon = self.supcon_loss(joint_feats, joint_labels, anchor_mask=anchor_mask)
 
                 # 2. Destilación asimétrica sobre samples de la tarea actual (vista-0)
                 distill = self._compute_distillation(x2v[:, 0])
@@ -215,10 +224,3 @@ class Co2L(BaseMethod):
         return self.distill_loss(z_curr, z_prev)
 
 
-def _random_flip(imgs: torch.Tensor) -> torch.Tensor:
-    """Flip horizontal aleatorio e independiente por imagen (p=0.5)."""
-    mask = torch.rand(imgs.size(0), device=imgs.device) > 0.5
-    out  = imgs.clone()
-    if mask.any():
-        out[mask] = torch.flip(imgs[mask], dims=[-1])
-    return out

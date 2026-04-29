@@ -39,7 +39,15 @@ class SupConLoss(nn.Module):
         self,
         features: torch.Tensor,
         labels: torch.Tensor | None = None,
+        anchor_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """
+        features:    (B, n_views, feat_dim) — L2-normalizadas.
+        labels:      (B,) enteros opcionales. None → SimCLR.
+        anchor_mask: (B,) bool opcional. True = el sample actúa como anchor
+                     (contribuye al numerador). False = solo aparece en el
+                     denominador como negativo. None = todos son anchors.
+        """
         if features.ndim != 3:
             raise ValueError(
                 f"features debe ser (B, n_views, feat_dim), recibido {features.shape}"
@@ -95,6 +103,12 @@ class SupConLoss(nn.Module):
 
         # Rescaleo por temperatura como en el código oficial
         loss = -(self.temperature / self.base_temperature) * mean_log_prob
+
+        # Si se provee anchor_mask, solo promediamos sobre los anchors válidos
+        if anchor_mask is not None:
+            anchor_mask_rep = anchor_mask.to(device).repeat_interleave(n_views).bool()
+            valid = valid & anchor_mask_rep
+
         loss = loss[valid].mean()
 
         return loss
