@@ -2,29 +2,21 @@
 Contrastive Continual Learning (Co²L).
 Cha et al., ICCV 2021. https://arxiv.org/abs/2106.14413
 
-Objetivo combinado:
-    L = L_SupCon  +  λ · L_distill  +  L_CE
+Entrenamiento en dos fases por tarea:
 
-  L_SupCon  — Contrastive supervisado sobre el batch CONJUNTO:
-                (a) dos vistas de samples de la tarea actual
-                (b) dos vistas sintetizadas de samples del replay buffer
-              Aproxima representaciones de la misma clase independientemente
-              de si son de la tarea actual o pasada.
+  Fase 1 — Representaciones (train_task):
+    L = L_SupCon  +  λ · L_distill
+    El encoder y projector se entrenan con el objetivo contrastivo.
+    No hay CE aquí: el clasificador no se toca en esta fase.
 
-  L_distill — Asymmetric Distillation sobre samples de la tarea actual:
-                preserva la estructura de representaciones del modelo anterior.
-                Solo activo para t > 0 (teacher = snapshot antes de la tarea t).
+  Fase 2 — Clasificador (en el loop del notebook):
+    CE estándar con encoder frozen, sobre datos de la tarea actual + buffer.
+    Se entrena por separado después de end_task().
 
-  L_CE      — Cross-entropy sobre la vista-0 de la tarea actual.
-              Mantiene alineada la cabeza de clasificación.
-
-Construcción del batch conjunto
---------------------------------
-El loader SupCon produce batches (B, 2, C, H, W). El buffer guarda tensores de
-una sola vista; sintetizamos la segunda vista con flip horizontal aleatorio
-(suficiente como augmentación para el aprendizaje contrastivo).
-
-El buffer se actualiza al terminar cada tarea con muestras de una sola vista.
+  L_SupCon  — SupCon sobre batch conjunto (tarea actual como anchors,
+               buffer como negativos de una sola vista).
+  L_distill — Asymmetric Distillation sobre features del encoder.
+               Solo activa para t > 0.
 """
 
 from __future__ import annotations
@@ -34,7 +26,6 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from data.buffer import ReplayBuffer
@@ -51,8 +42,8 @@ SUPCON_TEMP = 0.07
 class Co2L(BaseMethod):
     """Implementación completa de Co²L (Cha et al. 2021).
 
-    Combina SupCon sobre batch conjunto (tarea actual + replay), destilación
-    asimétrica para preservar representaciones pasadas, y CE para la tarea actual.
+    Fase 1 (train_task): SupCon + A-Distill con encoder y projector.
+    Fase 2 (notebook): linear probe — CE con encoder frozen sobre tarea actual + buffer.
     """
 
     uses_replay: bool = True
@@ -108,7 +99,7 @@ class Co2L(BaseMethod):
         train_loader: DataLoader,
         n_epochs: int = 500,
     ) -> Dict[str, list]:
-        """Entrenamiento con SupCon + A-Distill + CE.
+        """Fase 1: SupCon + A-Distill. Sin CE — el clasificador se entrena aparte.
 
         train_loader es el loader estándar (una vista) para validación y end_task.
         El loader SupCon (dos vistas) se construye internamente.
@@ -128,16 +119,15 @@ class Co2L(BaseMethod):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=n_epochs
         )
-        ce_criterion = nn.CrossEntropyLoss()
 
         log: Dict[str, list] = {
-            "supcon": [], "distill": [], "ce": [], "loss": [], "acc": [],
+            "supcon": [], "distill": [], "loss": [],
         }
 
         for epoch in range(n_epochs):
             self.backbone.train()
-            running = dict(supcon=0.0, distill=0.0, ce=0.0, loss=0.0)
-            correct = total = 0
+            running = dict(supcon=0.0, distill=0.0, loss=0.0)
+            total = 0
 
             for x2v, labels_cur in supcon_loader:
                 # x2v: (B, 2, C, H, W),  labels_cur: (B,)
@@ -177,12 +167,9 @@ class Co2L(BaseMethod):
                 # 2. Destilación asimétrica sobre samples de la tarea actual (vista-0)
                 distill = self._compute_distillation(x2v[:, 0])
 
-                # 3. CE sobre la tarea actual (vista-0)
-                logits_cur = self.backbone(x2v[:, 0])
-                ce         = ce_criterion(logits_cur, labels_cur)
-
-                # 4. Loss combinada
-                loss = supcon + self.co2l_lambda * distill + ce
+                # Loss contrastiva + distilación (sin CE — el clasificador se entrena
+                # en una fase separada con encoder frozen después de end_task)
+                loss = supcon + self.co2l_lambda * distill
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -190,19 +177,16 @@ class Co2L(BaseMethod):
 
                 running["supcon"]  += supcon.item()  * B
                 running["distill"] += distill.item() * B
-                running["ce"]      += ce.item()      * B
                 running["loss"]    += loss.item()    * B
-                correct            += (logits_cur.argmax(1) == labels_cur).sum().item()
                 total              += B
 
             scheduler.step()
 
             n = max(total, 1)
-            for key in ("supcon", "distill", "ce", "loss"):
+            for key in ("supcon", "distill", "loss"):
                 log[key].append(running[key] / n)
-            log["acc"].append(correct / n)
             self._epoch_log(task_id, epoch, n_epochs,
-                            running["loss"] / n, correct / n)
+                            running["loss"] / n, 0.0)
 
         return log
 
