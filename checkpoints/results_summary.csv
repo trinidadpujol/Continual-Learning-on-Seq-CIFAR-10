@@ -1,0 +1,5 @@
+Method,Class-IL final,Task-IL final,Avg Forgetting (C),Avg Forgetting (T)
+Naive,0.1955,0.6475,0.9698,0.4047
+EWC,0.1957,0.6373,0.9673,0.4153
+LwF,0.2294,0.9601,0.4884,0.01
+Co²L,0.3505,0.836,0.7289,0.16
